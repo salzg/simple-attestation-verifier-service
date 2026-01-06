@@ -1,0 +1,10 @@
+{
+  "server_ip": "10.0.0.5",
+  "server_port": 8443,
+  "deployment_name": "my-deployment",
+  "requester_name": "alice",
+  "tls_verify": false,
+  "timeout_seconds": 25,
+  "work_dir": "/tmp/snp_client",
+  "keep_artifacts": true
+}

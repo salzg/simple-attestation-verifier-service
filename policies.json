@@ -1,0 +1,27 @@
+{
+  "example-deployment": {
+    "product_name": "Milan",
+
+    "nonce_ttl_seconds": 300,
+    "delete_session_after_success": true,
+
+    "allowed_report_versions": [4],
+    "expected_measurement_hex": "A5E1C7754D10F9CD6F86262421DBB7C1AB425F91C3F815B05B543506AE062574C5D2176C972AE9383EEC80CDF8D26C28",
+
+    "required_policy_bits_set": 0,
+    "forbidden_policy_bits_set": 0,
+
+    "required_flags_bits_set": 0,
+    "forbidden_flags_bits_set": 0,
+
+    "chip_id_allowlist_hex": [
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ],
+
+    "min_tcb": { "blSPL": 0, "teeSPL": 0, "snpSPL": 0, "ucodeSPL": 0 },
+
+    "expected_fields": [
+      { "name": "example_field", "offset": 256, "length": 16, "expected_hex": "00000000000000000000000000000000" }
+    ]
+  }
+}
