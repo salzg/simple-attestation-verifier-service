@@ -1,0 +1,69 @@
+body {
+  font-family: sans-serif;
+  margin: 16px;
+  max-width: 1100px;
+}
+
+.row {
+  margin: 10px 0;
+}
+
+label {
+  display: inline-block;
+  min-width: 210px;
+  font-weight: 600;
+}
+
+input[type="text"] {
+  width: 100%;
+  max-width: 980px;
+  padding: 6px;
+}
+
+textarea {
+  width: 100%;
+  height: 360px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  padding: 8px;
+}
+
+button {
+  padding: 8px 12px;
+  margin-right: 8px;
+}
+
+.box {
+  border: 1px solid #ddd;
+  padding: 10px;
+}
+
+.ok {
+  background: #e8fff0;
+  border: 1px solid #58a874;
+  padding: 10px;
+}
+
+.bad {
+  background: #ffecec;
+  border: 1px solid #cc5c5c;
+  padding: 10px;
+}
+
+.secret {
+  background: #fff7cc;
+  border: 1px solid #c2a400;
+  padding: 10px;
+  font-weight: 700;
+}
+
+.muted {
+  color: #666;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+.small {
+  font-size: 0.92em;
+}
