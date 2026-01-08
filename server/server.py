@@ -4,7 +4,7 @@ HTTPS AMD SEV-SNP attestation + secret release server.
 
 Endpoints:
   GET  /                  - barebones HTML log view (live via SSE when possible)
-  POST /<deployment_name> - stage=init   -> returns 64-byte nonce as request_id (base64)
+  POST /<deployment_name> - stage=init   -> returns 64-byte nonce (base64) and a request_id
                           - stage=attest -> verifies nonce+policy+signature, returns secret
 
 Dependencies:
@@ -69,8 +69,8 @@ AMD_KDS_BASE = "https://kdsintf.amd.com"
 # ----------------------------
 @dataclass
 class Session:
-    request_id_b64: str
-    nonce: bytes
+    request_id: str             # session identifier, not nonce!
+    nonce: bytes                    # 64-byte nonce to be embedded in the attestation report
     deployment_name: str
     requester_name: str
     requester_deployment_name: str
@@ -743,7 +743,7 @@ async def handle_post_deployment(request: web.Request) -> web.Response:
         deployment_name, stage, requester_name, requester_deployment_name
     )
 
-    # Load policy + secrets (simple and safe)
+    # Load policy + secrets
     try:
         policies = load_json_file_if_exists(policies_path, default={})
         secrets_list = load_json_file_if_exists(secrets_path, default=[])
@@ -768,9 +768,12 @@ async def handle_post_deployment(request: web.Request) -> web.Response:
 
     if stage == "init":
         nonce = os.urandom(64)
-        request_id_b64 = b64e(nonce)
+        nonce_b64 = base64.b64encode(nonce).decode("ascii")
+
+        request_id = base64.urlsafe_b64encode(os.urandom(24)).decode("ascii")
+
         sess = Session(
-            request_id_b64=request_id_b64,
+            request_id=request_id,
             nonce=nonce,
             deployment_name=deployment_name,
             requester_name=requester_name,
@@ -778,15 +781,16 @@ async def handle_post_deployment(request: web.Request) -> web.Response:
             created_utc=now_utc_iso(),
             used=False,
         )
-        sessions[request_id_b64] = sess
+        sessions[request_id] = sess
+
         logger.info(
-            "Issued nonce request_id=%s ttl=%ds deployment=%s requester=%s",
-            request_id_b64, ttl, requester_deployment_name, requester_name
+            "Issued nonce request_id=%s ttl=%ds deployment=%s requester=%s, nonce_b64=%s",
+            request_id, ttl, requester_deployment_name, requester_name, nonce_b64
         )
 
         return web.json_response({
-            "request_id": request_id_b64,
-            "nonce_b64": request_id_b64,
+            "request_id": request_id,
+            "nonce_b64": nonce_b64,
             "expires_in_seconds": ttl,
             "note": "Embed this 64-byte nonce into SNP report_data (offset 0x50, length 64). Then POST stage=attest."
         })
@@ -820,21 +824,22 @@ async def handle_post_deployment(request: web.Request) -> web.Response:
         deployment_name, requester_deployment_name, requester_name, policy_summary(policy)
     )
 
-    request_id_b64 = body.get("request_id")
+    request_id = body.get("request_id")
     report_b64 = body.get("attestation_report_b64")
 
-    if not isinstance(request_id_b64, str) or not request_id_b64:
+    if not isinstance(request_id, str) or not request_id:
         logger.warning("ATTEST missing request_id deployment=%s requester=%s", requester_deployment_name, requester_name)
         return web.json_response({"error": "missing request_id"}, status=400)
+
     if not isinstance(report_b64, str) or not report_b64:
         logger.warning("ATTEST missing attestation_report_b64 deployment=%s requester=%s", requester_deployment_name, requester_name)
         return web.json_response({"error": "missing attestation_report_b64"}, status=400)
 
-    logger.info("ATTEST inputs request_id_len=%d report_b64_len=%d", len(request_id_b64), len(report_b64))
+    logger.info("ATTEST inputs request_id=%d report_b64_len=%d", request_id, len(report_b64))
 
-    sess = sessions.get(request_id_b64)
+    sess = sessions.get(request_id)
     if sess is None:
-        logger.warning("ATTEST unknown request_id=%s (init required)", request_id_b64)
+        logger.warning("ATTEST unknown request_id=%s (init required)", request_id)
         return web.json_response({"error": "unknown request_id (init required)"}, status=400)
 
     created = parse_iso_utc(sess.created_utc)
@@ -843,18 +848,18 @@ async def handle_post_deployment(request: web.Request) -> web.Response:
                 sess.created_utc, age, ttl, sess.used)
 
     if age > ttl:
-        logger.warning("ATTEST expired request_id=%s age=%.1fs ttl=%ds", request_id_b64, age, ttl)
-        sessions.pop(request_id_b64, None)
+        logger.warning("ATTEST expired request_id=%s age=%.1fs ttl=%ds", request_id, age, ttl)
+        sessions.pop(request_id, None)
         return web.json_response({"error": "request_id expired (re-init)"}, status=400)
 
     if sess.used:
-        logger.warning("ATTEST replay attempt request_id=%s", request_id_b64)
+        logger.warning("ATTEST replay attempt request_id=%s", request_id)
         return web.json_response({"error": "request_id already used"}, status=400)
 
     try:
         report_bytes = b64d(report_b64)
     except binascii.Error:
-        logger.warning("ATTEST invalid base64 report_b64 (decode failed) request_id=%s", request_id_b64)
+        logger.warning("ATTEST invalid base64 report_b64 (decode failed) request_id=%s", request_id)
         return web.json_response({"error": "attestation_report_b64 is not valid base64"}, status=400)
 
     logger.info("ATTEST report decoded report_bytes_len=%d", len(report_bytes))
@@ -862,7 +867,7 @@ async def handle_post_deployment(request: web.Request) -> web.Response:
     try:
         parsed = parse_snp_report(report_bytes, logger)
     except Exception as e:
-        logger.exception("ATTEST failed to parse report request_id=%s", request_id_b64)
+        logger.exception("ATTEST failed to parse report request_id=%s", request_id)
         return web.json_response({"error": f"failed to parse report: {e}"}, status=400)
 
     tcb_components = decode_reported_tcb_components(parsed.reported_tcb_u64)
@@ -880,11 +885,11 @@ async def handle_post_deployment(request: web.Request) -> web.Response:
     if not constant_time_eq(parsed.report_data, sess.nonce):
         logger.warning(
             "ATTEST nonce mismatch request_id=%s report_data_sha256=%s nonce_sha256=%s",
-            request_id_b64, sha256_hex(parsed.report_data), sha256_hex(sess.nonce)
+            request_id, sha256_hex(parsed.report_data), sha256_hex(sess.nonce)
         )
         return web.json_response({"error": "nonce mismatch (report_data != issued nonce)"}, status=401)
 
-    logger.info("ATTEST nonce verified request_id=%s", request_id_b64)
+    logger.info("ATTEST nonce verified request_id=%s", request_id)
 
     # Policy evaluation
     logger.info("ATTEST policy evaluation begin deployment=%s", requester_deployment_name)
@@ -928,11 +933,11 @@ async def handle_post_deployment(request: web.Request) -> web.Response:
                 logger.info("VCEK pubkey curve=%s key_size=%d", pub.curve.name, pub.key_size)
 
         except Exception as e:
-            logger.exception("ATTEST certificate retrieval or verification failed request_id=%s", request_id_b64)
+            logger.exception("ATTEST certificate retrieval or verification failed request_id=%s", request_id)
             return web.json_response({"error": f"certificate verification failed: {e}"}, status=502)
 
     # Verify report signature
-    logger.info("ATTEST report signature verify begin request_id=%s", request_id_b64)
+    logger.info("ATTEST report signature verify begin request_id=%s", request_id)
 
     # Pre-log the exact bytes
     try:
@@ -955,7 +960,7 @@ async def handle_post_deployment(request: web.Request) -> web.Response:
         # Many cryptography exceptions (e.g., InvalidSignature) stringify to empty.
         logger.warning(
             "ATTEST report signature INVALID request_id=%s exc_type=%s exc_repr=%r",
-            request_id_b64, type(e).__name__, e
+            request_id, type(e).__name__, e
         )
         logger.error("ATTEST report signature exception traceback:\n%s", traceback.format_exc())
         return web.json_response(
@@ -969,11 +974,11 @@ async def handle_post_deployment(request: web.Request) -> web.Response:
             status=401
         )
 
-    logger.info("ATTEST report signature VERIFIED request_id=%s", request_id_b64)
+    logger.info("ATTEST report signature VERIFIED request_id=%s", request_id)
 
     # Mark nonce used (replay protection)
     sess.used = True
-    logger.info("ATTEST session marked used request_id=%s", request_id_b64)
+    logger.info("ATTEST session marked used request_id=%s", request_id)
 
     # Release secret
     logger.info("ATTEST secret lookup begin deployment=%s", requester_deployment_name)
@@ -990,17 +995,18 @@ async def handle_post_deployment(request: web.Request) -> web.Response:
     logger.info("ATTEST secret lookup success deployment=%s (secret not logged)", requester_deployment_name)
     logger.info(
         "ATTEST success request_id=%s deployment=%s requester=%s delete_session_after_success=%s",
-        request_id_b64, requester_deployment_name, requester_name,
+        request_id, requester_deployment_name, requester_name,
         bool(policy.get("delete_session_after_success", True))
     )
 
     if bool(policy.get("delete_session_after_success", True)):
-        sessions.pop(request_id_b64, None)
-        logger.info("ATTEST session deleted request_id=%s", request_id_b64)
+        sessions.pop(request_id, None)
+        logger.info("ATTEST session deleted request_id=%s", request_id)
 
     return web.json_response({
         "deployment_name": requester_deployment_name,
         "requester_name": requester_name,
+        "request_id": request_id,
         "secret": secret,
         "report": {
             "version": parsed.version,

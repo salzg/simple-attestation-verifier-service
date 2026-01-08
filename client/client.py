@@ -19,6 +19,22 @@ Flow:
   4) Run: <snpguest_path> report <att-report-path> <request-file>
   5) Base64-encode the raw report bytes and POST stage=attest to receive the secret
 
+Default behavior:
+  sudo ./client.py client_config.json
+  -> init -> snpguest report -> attest -> prints secret
+
+Optional split behavior:
+  Step 1: request nonce
+    sudo ./client.py client_config.json --init-only
+    -> prints request_id (base64 nonce) to stdout
+    (Flow stages 1 and 2)
+
+  Step 2: attest using a provided request_id (base64 nonce)
+    sudo ./client.py client_config.json --attest-only --request-id "<BASE64_NONCE>"
+    -> prints secret (or failed response) to stdout
+    (Flow stages 1, 3-5)
+
+
 Config example (client_config.json):
 {
   "server_ip": "10.0.0.5",
@@ -46,7 +62,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import requests
 
@@ -178,6 +194,118 @@ def run_snpguest_report(
 
     info(f"Attestation report written: {report_path} ({report_path.stat().st_size} bytes)", verbose)
 
+# ----------------------------
+# helpers
+# ----------------------------
+def build_server_url(cfg: Dict[str, Any]) -> str:
+    server_ip = str(cfg.get("server_ip", "")).strip()
+    server_port = int(cfg.get("server_port", 8443))
+    deployment_name = str(cfg.get("deployment_name", "")).strip()
+    if not server_ip:
+        die("Config missing server_ip")
+    if not deployment_name:
+        die("Config missing deployment_name")
+    return f"https://{server_ip}:{server_port}/{deployment_name}"
+
+
+def request_nonce(
+    sess: requests.Session,
+    url: str,
+    requester_name: str,
+    deployment_name: str,
+    timeout: int,
+    tls_verify: bool,
+    verbose: bool = False,
+) -> Tuple[str, bytes, Dict[str, Any]]:
+    # should return (request_id, nonce_b64, nonce_raw_64, full_init_json)
+    init_payload = {
+        "stage": "init",
+        "requester_name": requester_name,
+        "requester_deployment_name": deployment_name,
+    }
+    info(f"INIT request payload keys: {list(init_payload.keys())}", verbose)
+
+    try:
+        r = sess.post(url, json=init_payload, timeout=timeout, verify=tls_verify)
+    except requests.RequestException as e:
+        die(f"Failed to contact server (init): {e}")
+
+    info(f"INIT response status: {r.status_code}", verbose)
+    if r.status_code != 200:
+        die(f"Init failed: HTTP {r.status_code}: {r.text}")
+
+    init_resp = r.json()
+    request_id = init_resp.get("request_id")
+
+    if not isinstance(request_id, str):
+        die("Init response missing request_id")
+
+    nonce_b64 = init_resp.get("nonce_b64")
+
+    if not isinstance(nonce_b64, str) or not nonce_b64:
+        die("Init response missing nonce_b64")
+
+    try:
+        nonce = base64.b64decode(nonce_b64, validate=True)
+    except Exception as e:
+        die(f"Init response nonce_b64 is invalid base64: {e}")
+
+    if len(nonce) != 64:
+        die(f"Nonce length != 64: {len(nonce)}")
+
+    return request_id, nonce_b64, nonce, init_resp
+
+
+def build_report_b64_from_nonce(
+    snpguest_path: str,
+    nonce_64: bytes,
+    work_dir: Path,
+    verbose: bool,
+) -> Tuple[str, Path, Path]:
+    work_dir.mkdir(parents=True, exist_ok=True)
+    report_path = work_dir / "attestation_report.bin"
+    request_file_path = work_dir / "attestation_request.bin"
+
+    run_snpguest_report(snpguest_path, nonce_64, report_path, request_file_path, verbose)
+
+    report_bytes = report_path.read_bytes()
+    report_b64 = base64.b64encode(report_bytes).decode("ascii")
+
+    info(f"Report binary size: {len(report_bytes)} bytes", verbose)
+    info(f"Report base64 size: {len(report_b64)} chars", verbose)
+    return report_b64, report_path, request_file_path
+
+
+def submit_attestation(
+    sess: requests.Session,
+    url: str,
+    request_id: str,
+    requester_name: str,
+    deployment_name: str,
+    attestation_report_b64: str,
+    timeout: int,
+    tls_verify: bool,
+    verbose: bool = False,
+) -> Dict[str, Any]:
+    attest_payload = {
+        "stage": "attest",
+        "request_id": request_id,
+        "requester_name": requester_name,
+        "requester_deployment_name": deployment_name,
+        "attestation_report_b64": attestation_report_b64,
+    }
+
+    try:
+        r2 = sess.post(url, json=attest_payload, timeout=timeout, verify=tls_verify)
+    except requests.RequestException as e:
+        die(f"Failed to contact server (attest): {e}")
+
+    info(f"ATTEST response status: {r2.status_code}", verbose)
+    if r2.status_code != 200:
+        die(f"Attest failed: HTTP {r2.status_code}: {r2.text}")
+
+    attest_resp = r2.json()
+    return attest_resp
 
 # ----------------------------
 # Main flow
@@ -186,6 +314,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="SEV-SNP attestation client (snpguest)")
     parser.add_argument("config", help="Path to client config JSON")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
+
+    # Optional split flags (default behavior unchanged unless you set these)
+    g = parser.add_mutually_exclusive_group()
+    g.add_argument("--init-only", action="store_true", help="Only request nonce (stage=init) and print request_id")
+    g.add_argument("--attest-only", action="store_true", help="Only perform attestation (stage=attest); requires --request-id")
+
+    parser.add_argument("--request-id",help="request_id to be used for --attest-only.")
+    parser.add_argument("--nonce-b64", help="Base64 nonce from init response (nonce_b64). Required for --attest-only.")
+
+
     args = parser.parse_args()
 
     # Enforce sudo/root invocation
@@ -203,6 +341,11 @@ def main() -> None:
     deployment_name = str(cfg.get("deployment_name", "")).strip()
     requester_name = str(cfg.get("requester_name", "")).strip()
 
+    if not requester_name:
+        die("Config missing requester_name")
+    if not deployment_name:
+        die("Config missing deployment_name")
+
     tls_verify = bool(cfg.get("tls_verify", False))
     timeout = int(cfg.get("timeout_seconds", 25))
 
@@ -219,70 +362,103 @@ def main() -> None:
     snpguest_path = ensure_snpguest_present(cfg, args.verbose)
     info(f"Using snpguest at: {snpguest_path}", args.verbose)
 
-    url = f"https://{server_ip}:{server_port}/{deployment_name}"
+    url = build_server_url(cfg)
     info(f"Server URL: {url}", args.verbose)
     info(f"TLS verify: {tls_verify}", args.verbose)
 
     sess = requests.Session()
 
-    # INIT
-    init_payload = {
-        "stage": "init",
-        "requester_name": requester_name,
-        "requester_deployment_name": deployment_name,
-    }
-    info(f"INIT request payload keys: {list(init_payload.keys())}", args.verbose)
 
-    try:
-        r = sess.post(url, json=init_payload, timeout=timeout, verify=tls_verify)
-    except requests.RequestException as e:
-        die(f"Failed to contact server (init): {e}")
+    # init only
+    if args.init_only:
+        request_id, nonce_b64, _nonce, init_resp = request_nonce(
+            sess=sess,
+            url=url,
+            requester_name=requester_name,
+            deployment_name=deployment_name,
+            timeout=timeout,
+            tls_verify=tls_verify,
+            verbose=args.verbose,
+        )
+        # just print request id for possible piping
+        print(json.dumps({"request_id": request_id, "nonce_b64": nonce_b64}, indent=2))
+        return
 
-    info(f"INIT response status: {r.status_code}", args.verbose)
-    if r.status_code != 200:
-        die(f"Init failed: HTTP {r.status_code}: {r.text}")
+    # attest only
+    if args.attest_only:
+        if not args.request_id:
+            die("--attest-only requires --request-id and --nonce-b64")
 
-    init_resp = r.json()
-    request_id = init_resp.get("request_id")
-    if not isinstance(request_id, str):
-        die("Init response missing request_id")
+        request_id = str(args.request_id).strip()
+        try:
+            nonce = base64.b64decode(request_id, validate=True)
+        except Exception as e:
+            die(f"Invalid base64 nonce_b64: {e}")
 
-    nonce = base64.b64decode(request_id, validate=True)
-    if len(nonce) != 64:
-        die(f"Nonce length != 64: {len(nonce)}")
+        if len(nonce) != 64:
+            die(f"Nonce length != 64 after decoding nonce_b64, got: {len(nonce)}")
 
-    # REPORT
-    work_dir.mkdir(parents=True, exist_ok=True)
-    report_path = work_dir / "attestation_report.bin"
-    request_file_path = work_dir / "attestation_request.bin"
+        report_b64, report_path, request_file_path = build_report_b64_from_nonce(
+            snpguest_path=snpguest_path,
+            nonce_64=nonce,
+            work_dir=work_dir,
+            verbose=args.verbose,
+        )
+        attest_resp = submit_attestation(
+            sess=sess,
+            url=url,
+            request_id=request_id,
+            requester_name=requester_name,
+            deployment_name=deployment_name,
+            attestation_report_b64=report_b64,
+            timeout=timeout,
+            tls_verify=tls_verify,
+            verbose=args.verbose,
+        )
+        secret = attest_resp.get("secret")
+        if not isinstance(secret, str):
+            die("No secret in response")
+        print(secret)
 
-    run_snpguest_report(snpguest_path, nonce, report_path, request_file_path, args.verbose)
+        if not keep_artifacts:
+            report_path.unlink(missing_ok=True)
+            request_file_path.unlink(missing_ok=True)
+            info("Cleaned up temporary artifacts", args.verbose)
+        else:
+            info(f"Kept artifacts in {work_dir}", args.verbose)
+        return
 
-    report_bytes = report_path.read_bytes()
-    report_b64 = base64.b64encode(report_bytes).decode("ascii")
 
-    info(f"Report binary size: {len(report_bytes)} bytes", args.verbose)
-    info(f"Report base64 size: {len(report_b64)} chars", args.verbose)
+    # default flow
+    request_id, nonce, _init_resp = request_nonce(
+        sess=sess,
+        url=url,
+        requester_name=requester_name,
+        deployment_name=deployment_name,
+        timeout=timeout,
+        tls_verify=tls_verify,
+        verbose=args.verbose,
+    )
 
-    # ATTEST
-    attest_payload = {
-        "stage": "attest",
-        "request_id": request_id,
-        "requester_name": requester_name,
-        "requester_deployment_name": deployment_name,
-        "attestation_report_b64": report_b64,
-    }
+    report_b64, report_path, request_file_path = build_report_b64_from_nonce(
+        snpguest_path=snpguest_path,
+        nonce_64=nonce,
+        work_dir=work_dir,
+        verbose=args.verbose,
+    )
 
-    try:
-        r2 = sess.post(url, json=attest_payload, timeout=timeout, verify=tls_verify)
-    except requests.RequestException as e:
-        die(f"Failed to contact server (attest): {e}")
+    attest_resp = submit_attestation(
+        sess=sess,
+        url=url,
+        request_id_b64=request_id,
+        requester_name=requester_name,
+        deployment_name=deployment_name,
+        attestation_report_b64=report_b64,
+        timeout=timeout,
+        tls_verify=tls_verify,
+        verbose=args.verbose,
+    )
 
-    info(f"ATTEST response status: {r2.status_code}", args.verbose)
-    if r2.status_code != 200:
-        die(f"Attest failed: HTTP {r2.status_code}: {r2.text}")
-
-    attest_resp = r2.json()
     secret = attest_resp.get("secret")
     if not isinstance(secret, str):
         die("No secret in response")
