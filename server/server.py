@@ -835,7 +835,7 @@ async def handle_post_deployment(request: web.Request) -> web.Response:
         logger.warning("ATTEST missing attestation_report_b64 deployment=%s requester=%s", requester_deployment_name, requester_name)
         return web.json_response({"error": "missing attestation_report_b64"}, status=400)
 
-    logger.info("ATTEST inputs request_id=%d report_b64_len=%d", request_id, len(report_b64))
+    logger.info("ATTEST inputs request_id=%s report_b64_len=%d", request_id, len(report_b64))
 
     sess = sessions.get(request_id)
     if sess is None:
