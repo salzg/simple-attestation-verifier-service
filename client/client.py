@@ -221,7 +221,6 @@ def request_nonce(
     init_payload = {
         "stage": "init",
         "requester_name": requester_name,
-        "requester_deployment_name": deployment_name,
     }
     info(f"INIT request payload keys: {list(init_payload.keys())}", verbose)
 
@@ -291,7 +290,6 @@ def submit_attestation(
         "stage": "attest",
         "request_id": request_id,
         "requester_name": requester_name,
-        "requester_deployment_name": deployment_name,
         "attestation_report_b64": attestation_report_b64,
     }
 
@@ -314,6 +312,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="SEV-SNP attestation client (snpguest)")
     parser.add_argument("config", help="Path to client config JSON")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
+    parser.add_argument("--deployment-name", help="Override deployment_name from config (used as path component on server, e.g. https://IP:PORT/<deployment>)")
 
     # Optional split flags (default behavior unchanged unless you set these)
     g = parser.add_mutually_exclusive_group()
@@ -340,6 +339,15 @@ def main() -> None:
     server_port = int(cfg.get("server_port", 8443))
     deployment_name = str(cfg.get("deployment_name", "")).strip()
     requester_name = str(cfg.get("requester_name", "")).strip()
+
+    if args.deployment_name:
+        override = str(args.deployment_name).strip()
+        if not override:
+            raise SystemExit("ERROR: --deployment-name was provided but is empty after stripping")
+        if args.verbose:
+            print(f"[client] Overriding deployment_name: {cfg.get('deployment_name')} -> {override}")
+        cfg["deployment_name"] = override
+
 
     if not requester_name:
         die("Config missing requester_name")
@@ -390,8 +398,10 @@ def main() -> None:
             die("--attest-only requires --request-id and --nonce-b64")
 
         request_id = str(args.request_id).strip()
+        nonce_b64 = str(args.nonce_b64).strip()
+
         try:
-            nonce = base64.b64decode(request_id, validate=True)
+            nonce = base64.b64decode(nonce_b64, validate=True)
         except Exception as e:
             die(f"Invalid base64 nonce_b64: {e}")
 
@@ -430,7 +440,7 @@ def main() -> None:
 
 
     # default flow
-    request_id, nonce, _init_resp = request_nonce(
+    request_id, nonce_b64, nonce, _init_resp = request_nonce(
         sess=sess,
         url=url,
         requester_name=requester_name,
@@ -450,7 +460,7 @@ def main() -> None:
     attest_resp = submit_attestation(
         sess=sess,
         url=url,
-        request_id_b64=request_id,
+        request_id=request_id,
         requester_name=requester_name,
         deployment_name=deployment_name,
         attestation_report_b64=report_b64,

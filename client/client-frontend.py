@@ -47,7 +47,7 @@ import ssl
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, Optional
 
 import requests
 
@@ -73,7 +73,6 @@ CONTENT_TYPES = {
     ".txt": "text/plain; charset=utf-8",
 }
 
-
 def safe_read_asset(web_root: Path, rel: str) -> Tuple[bytes, str]:
     # Reads a file from web_root with traversal protection. Returns (bytes, content_type)
     rel = rel.lstrip("/")
@@ -94,17 +93,28 @@ def extract_measurement_hex(report_bytes: bytes) -> str:
     return report_bytes[OFF_MEASUREMENT:end].hex()
 
 
-def build_server_url(cfg: Dict[str, Any]) -> str:
+def build_server_url(cfg: Dict[str, Any], deployment_name_given: Optional[str] = None) -> str:
     # https://{server_ip}:{server_port}/{deployment_name}
+    # If deployment_name is provided, it overrides cfg["deployment_name"] for this call.
 
     server_ip = str(cfg.get("server_ip", "")).strip()
     server_port = int(cfg.get("server_port", 8443))
-    deployment_name = str(cfg.get("deployment_name", "")).strip()
+    deployment_name = str(deployment_name_given if deployment_name_given is not None else cfg.get("deployment_name", "")).strip()
     if not server_ip:
         raise RuntimeError("Config missing server_ip")
     if not deployment_name:
         raise RuntimeError("Config missing deployment_name")
     return f"https://{server_ip}:{server_port}/{deployment_name}"
+
+
+def build_server_base_url(cfg: Dict[str, Any]) -> str:
+    server_ip = str(cfg.get("server_ip", "")).strip()
+    server_port = int(cfg.get("server_port", 8443))
+
+    if not server_ip:
+        raise ValueError("client_config missing server_ip")
+
+    return f"https://{server_ip}:{server_port}"
 
 
 def compute_actual_measurement_hex(cfg: Dict[str, Any], snpguest_path: str, work_dir: Path, verbose: bool) -> str:
@@ -122,11 +132,11 @@ def compute_actual_measurement_hex(cfg: Dict[str, Any], snpguest_path: str, work
 
 # server calls (init and attest)
 
-def call_init(sess: requests.Session, url: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
+def call_init(sess: requests.Session, cfg: Dict[str, Any], deployment_name: str) -> Dict[str, Any]:
+    url = build_server_url(cfg, deployment_name)
     payload = {
         "stage": "init",
         "requester_name": str(cfg.get("requester_name", "")).strip(),
-        "requester_deployment_name": str(cfg.get("deployment_name", "")).strip(),
     }
     timeout = int(cfg.get("timeout_seconds", 25))
     verify = bool(cfg.get("tls_verify", False))
@@ -140,12 +150,12 @@ def call_init(sess: requests.Session, url: str, cfg: Dict[str, Any]) -> Dict[str
     return out
 
 
-def call_attest(sess: requests.Session, url: str, cfg: Dict[str, Any], request_id: str, report_b64: str) -> Dict[str, Any]:
+def call_attest(sess: requests.Session, cfg: Dict[str, Any], deployment_name: str, request_id: str, report_b64: str) -> Dict[str, Any]:
+    url = build_server_url(cfg, deployment_name)
     payload = {
         "stage": "attest",
         "request_id": request_id,  # session id, NOT the nonce
         "requester_name": str(cfg.get("requester_name", "")).strip(),
-        "requester_deployment_name": str(cfg.get("deployment_name", "")).strip(),
         "attestation_report_b64": report_b64,
     }
     timeout = int(cfg.get("timeout_seconds", 25))
@@ -212,10 +222,12 @@ class Handler(BaseHTTPRequestHandler):
         # API
         if self.path.split("?", 1)[0] == "/api/config":
             self._json(200, {
-                "vm_name": st["vm_name"],
-                "server_url": st["server_url"],
-                "actual_measurement_hex": st.get("actual_measurement_hex"),
-                "actual_measurement_error": st.get("actual_measurement_error"),
+                "ok": True,
+                "requester_name": st["client_cfg"].get("requester_name", ""),
+                "deployment_name": st["client_cfg"].get("deployment_name", ""),
+                "server_base_url": st.get("server_base_url"),
+                "actual_measurement_hex": st["actual_measurement_hex"],
+                "actual_measurement_error": st["actual_measurement_error"]
             })
             return
 
@@ -237,22 +249,30 @@ class Handler(BaseHTTPRequestHandler):
             st = self.server.state  # type: ignore[attr-defined]
 
             if self.path == "/api/init":
-                sess: requests.Session = st["http_session"]
-                init_resp = call_init(sess, st["server_url"], st["client_cfg"])
+                clen = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(clen) if clen > 0 else b"{}"
+                body = json.loads(raw.decode("utf-8"))
+                deployment_name = str(body.get("deployment_name") or st["client_cfg"].get("deployment_name", "")).strip()
+                if not deployment_name:
+                    self._json(400, {"ok": False, "error": "deployment_name missing (no override and not in config)"})
+                    return
 
-                ok = (
-                    init_resp.get("http_status") == 200
-                    and isinstance(init_resp.get("json"), dict)
-                    and isinstance(init_resp["json"].get("request_id"), str)
-                    and isinstance(init_resp["json"].get("nonce_b64"), str)
+                sess: requests.Session = st["http_session"]
+                res = call_init(
+                    sess=sess,
+                    cfg=st["client_cfg"],
+                    deployment_name=deployment_name,
                 )
 
-                out: Dict[str, Any] = {"ok": ok, "init": init_resp}
-                if ok:
-                    out["request_id"] = init_resp["json"]["request_id"]
-                    out["nonce_b64"] = init_resp["json"]["nonce_b64"]
 
-                self._json(200, out)
+                j = res.get("json") if isinstance(res.get("json"), dict) else {}
+                self._json(200, {
+                    "ok": (res.get("http_status") == 200),
+                    "deployment_name": deployment_name,
+                    "request_id": j.get("request_id"),
+                    "nonce_b64": j.get("nonce_b64"),
+                    "init": res,
+                })
                 return
 
             if self.path == "/api/attest":
@@ -262,6 +282,11 @@ class Handler(BaseHTTPRequestHandler):
 
                 request_id = str(body.get("request_id", "")).strip()
                 nonce_b64 = str(body.get("nonce_b64", "")).strip()
+
+                deployment_name = str(body.get("deployment_name") or st["client_cfg"].get("deployment_name", "")).strip()
+                if not deployment_name:
+                    self._json(400, {"ok": False, "error": "deployment_name missing (no override and not in config)"})
+                    return
 
                 if not request_id:
                     self._json(400, {"ok": False, "error": "missing request_id"})
@@ -290,7 +315,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 # Submit stage=attest (request_id is session id)
                 sess: requests.Session = st["http_session"]
-                att = call_attest(sess, st["server_url"], st["client_cfg"], request_id, report_b64)
+                att = call_attest(sess, st["client_cfg"], deployment_name, request_id, report_b64)
 
                 secret = None
                 secret_ok = False
@@ -364,11 +389,15 @@ def main() -> None:
     # Reuse config loader from client.py
     client_cfg = client_mod.load_config(str(client_cfg_path))
 
-    deployment_name = str(client_cfg.get("deployment_name", "")).strip()
-    if not deployment_name:
+    requester_name = str(client_cfg.get("requester_name", "")).strip()
+    if not requester_name:
+        raise SystemExit("ERROR: client config missing requester_name")
+
+    default_deployment_name = str(client_cfg.get("deployment_name", "")).strip()
+    if not default_deployment_name:
         raise SystemExit("ERROR: client config missing deployment_name")
 
-    server_url = build_server_url(client_cfg)
+    server_base_url = build_server_base_url(client_cfg)
 
     # Reuse snpguest path resolution from client.py
     snpguest_path = client_mod.ensure_snpguest_present(client_cfg, args.verbose)
@@ -389,8 +418,9 @@ def main() -> None:
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.state = {  # type: ignore[attr-defined]
         "client_cfg": client_cfg,
-        "vm_name": deployment_name,
-        "server_url": server_url,
+        "requester_name": requester_name,
+        "default_deployment_name": default_deployment_name,
+        "server_base_url": server_base_url,
         "snpguest_path": snpguest_path,
         "work_dir": work_dir,
         "http_session": http_session,
@@ -406,8 +436,9 @@ def main() -> None:
 
     print(f"[INFO] Frontend listening on https://{args.host}:{args.port}/")
     print(f"[INFO] Web root: {web_root}")
-    print(f"[INFO] Attestation server: {server_url}")
-    print(f"[INFO] VM name: {deployment_name}")
+    print(f"[INFO] Attestation server base: {server_base_url}")
+    print(f"[INFO] requester_name: {requester_name}")
+    print(f"[INFO] default deployment_name: {default_deployment_name}")
     if actual_measurement_hex:
         print(f"[INFO] Actual measurement (hex): {actual_measurement_hex}")
     else:

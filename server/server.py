@@ -73,7 +73,6 @@ class Session:
     nonce: bytes                    # 64-byte nonce to be embedded in the attestation report
     deployment_name: str
     requester_name: str
-    requester_deployment_name: str
     created_utc: str
     used: bool = False
 
@@ -736,11 +735,10 @@ async def handle_post_deployment(request: web.Request) -> web.Response:
 
     stage = body.get("stage")
     requester_name = str(body.get("requester_name", "")).strip()
-    requester_deployment_name = str(body.get("requester_deployment_name", deployment_name)).strip()
 
     logger.info(
-        "POST /%s stage=%s requester_name=%s requester_deployment_name=%s",
-        deployment_name, stage, requester_name, requester_deployment_name
+        "POST /%s stage=%s requester_name=%s",
+        deployment_name, stage, requester_name
     )
 
     # Load policy + secrets
@@ -751,17 +749,14 @@ async def handle_post_deployment(request: web.Request) -> web.Response:
         logger.exception("Failed to load policies/secrets")
         return web.json_response({"error": f"server config load failed: {e}"}, status=500)
 
-    policy = policies.get(requester_deployment_name) or policies.get(deployment_name)
+    policy = policies.get(deployment_name)
     if policy is None:
-        logger.warning(
-            "No policy found for deployment_name=%s (requester_deployment_name=%s)",
-            deployment_name, requester_deployment_name
-        )
+        logger.warning("No policy found for deployment_name=%s", deployment_name)
         return web.json_response({"error": "unknown deployment_name (no policy)"}, status=404)
 
     product_name = policy.get("product_name")
     if not product_name:
-        logger.error("Policy missing product_name for deployment=%s", requester_deployment_name)
+        logger.error("Policy missing product_name for deployment=%s", deployment_name)
         return web.json_response({"error": "policy missing required field: product_name"}, status=500)
 
     ttl = int(policy.get("nonce_ttl_seconds", 300))
@@ -777,7 +772,6 @@ async def handle_post_deployment(request: web.Request) -> web.Response:
             nonce=nonce,
             deployment_name=deployment_name,
             requester_name=requester_name,
-            requester_deployment_name=requester_deployment_name,
             created_utc=now_utc_iso(),
             used=False,
         )
@@ -785,13 +779,14 @@ async def handle_post_deployment(request: web.Request) -> web.Response:
 
         logger.info(
             "Issued nonce request_id=%s ttl=%ds deployment=%s requester=%s, nonce_b64=%s",
-            request_id, ttl, requester_deployment_name, requester_name, nonce_b64
+            request_id, ttl, deployment_name, requester_name, nonce_b64
         )
 
         return web.json_response({
             "request_id": request_id,
             "nonce_b64": nonce_b64,
             "expires_in_seconds": ttl,
+            "deployment_name": deployment_name,
             "note": "Embed this 64-byte nonce into SNP report_data (offset 0x50, length 64). Then POST stage=attest."
         })
 
@@ -820,19 +815,19 @@ async def handle_post_deployment(request: web.Request) -> web.Response:
         }
 
     logger.info(
-        "ATTEST begin deployment=%s requester_deployment_name=%s requester_name=%s policy_summary=%s",
-        deployment_name, requester_deployment_name, requester_name, policy_summary(policy)
+        "ATTEST begin deployment=%s requester_name=%s policy_summary=%s",
+        deployment_name, requester_name, policy_summary(policy)
     )
 
     request_id = body.get("request_id")
     report_b64 = body.get("attestation_report_b64")
 
     if not isinstance(request_id, str) or not request_id:
-        logger.warning("ATTEST missing request_id deployment=%s requester=%s", requester_deployment_name, requester_name)
+        logger.warning("ATTEST missing request_id deployment=%s requester=%s", deployment_name, requester_name)
         return web.json_response({"error": "missing request_id"}, status=400)
 
     if not isinstance(report_b64, str) or not report_b64:
-        logger.warning("ATTEST missing attestation_report_b64 deployment=%s requester=%s", requester_deployment_name, requester_name)
+        logger.warning("ATTEST missing attestation_report_b64 deployment=%s requester=%s", deployment_name, requester_name)
         return web.json_response({"error": "missing attestation_report_b64"}, status=400)
 
     logger.info("ATTEST inputs request_id=%s report_b64_len=%d", request_id, len(report_b64))
@@ -841,6 +836,18 @@ async def handle_post_deployment(request: web.Request) -> web.Response:
     if sess is None:
         logger.warning("ATTEST unknown request_id=%s (init required)", request_id)
         return web.json_response({"error": "unknown request_id (init required)"}, status=400)
+
+    if sess.deployment_name != deployment_name:
+        logger.warning("ATTEST deployment mismatch request_id=%s session_dep=%s url_dep=%s requester=%s", request_id, sess.deployment_name, deployment_name, requester_name)
+        return web.json_response({"error": "request_id was not issued for this deployment"}, status=400)
+
+    body_dep = body.get("deployment_name")
+    if body_dep is not None and str(body_dep).strip() and str(body_dep).strip() != deployment_name:
+        logger.warning(
+            "ATTEST body deployment differs from URL deployment request_id=%s body_dep=%s url_dep=%s",
+            request_id, body_dep, deployment_name
+        )
+        return web.json_response({"error": "deployment must be selected by URL path"}, status=400)
 
     created = parse_iso_utc(sess.created_utc)
     age = (dt.datetime.now(dt.timezone.utc) - created).total_seconds()
@@ -892,13 +899,13 @@ async def handle_post_deployment(request: web.Request) -> web.Response:
     logger.info("ATTEST nonce verified request_id=%s", request_id)
 
     # Policy evaluation
-    logger.info("ATTEST policy evaluation begin deployment=%s", requester_deployment_name)
+    logger.info("ATTEST policy evaluation begin deployment=%s", deployment_name)
     try:
         evaluate_policy(parsed, policy)
     except Exception as e:
-        logger.warning("ATTEST policy evaluation FAILED deployment=%s: %s", requester_deployment_name, e)
+        logger.warning("ATTEST policy evaluation FAILED deployment=%s: %s", deployment_name, e)
         return web.json_response({"error": f"policy check failed: {e}"}, status=403)
-    logger.info("ATTEST policy evaluation PASSED deployment=%s", requester_deployment_name)
+    logger.info("ATTEST policy evaluation PASSED deployment=%s", deployment_name)
 
     logger.info("ATTEST cert verification begin product_name=%s hwid(chip_id)=%s tcb=%s", product_name, parsed.chip_id.hex(), tcb_components)
 
@@ -981,21 +988,21 @@ async def handle_post_deployment(request: web.Request) -> web.Response:
     logger.info("ATTEST session marked used request_id=%s", request_id)
 
     # Release secret
-    logger.info("ATTEST secret lookup begin deployment=%s", requester_deployment_name)
+    logger.info("ATTEST secret lookup begin deployment=%s", deployment_name)
     secret = None
     for item in secrets_list:
-        if item.get("deployment_name") == requester_deployment_name:
+        if item.get("deployment_name") == deployment_name:
             secret = item.get("secret")
             break
 
     if secret is None:
-        logger.warning("ATTEST no secret configured for deployment_name=%s", requester_deployment_name)
+        logger.warning("ATTEST no secret configured for deployment_name=%s", deployment_name)
         return web.json_response({"error": "no secret configured for deployment"}, status=404)
 
-    logger.info("ATTEST secret lookup success deployment=%s (secret not logged)", requester_deployment_name)
+    logger.info("ATTEST secret lookup success deployment=%s (secret not logged)", deployment_name)
     logger.info(
         "ATTEST success request_id=%s deployment=%s requester=%s delete_session_after_success=%s",
-        request_id, requester_deployment_name, requester_name,
+        request_id, deployment_name, requester_name,
         bool(policy.get("delete_session_after_success", True))
     )
 
@@ -1004,7 +1011,7 @@ async def handle_post_deployment(request: web.Request) -> web.Response:
         logger.info("ATTEST session deleted request_id=%s", request_id)
 
     return web.json_response({
-        "deployment_name": requester_deployment_name,
+        "deployment_name": deployment_name,
         "requester_name": requester_name,
         "request_id": request_id,
         "secret": secret,
