@@ -137,6 +137,19 @@ def constant_time_eq(a: bytes, b: bytes) -> bool:
         r |= x ^ y
     return r == 0
 
+def parse_mask(mask: Any) -> int:
+    # mask can be str ("123"), hex str ("0x30000") or actual int
+    if mask is None:
+        return 0
+    if isinstance(mask, int):
+        return mask
+    if isinstance(mask, str):
+        s = mask.strip().lower()
+        if not s:
+            return 0
+        return int(mask, base=0)  # auto base
+    else:
+        return int(mask)
 
 def parse_iso_utc(s: str) -> dt.datetime:
     # tolerant ISO parsing; assumes UTC if missing tz
@@ -483,7 +496,7 @@ def evaluate_policy(parsed: ParsedReport, policy: Dict[str, Any]) -> None:
       - expected_measurement_hex: str (48 bytes / 96 hex chars)
       - required_policy_bits_set: int
       - forbidden_policy_bits_set: int
-      - required_flags_bits_set: int (bitmask on raw u32 at offset 0x48)
+      - required_flags_bits_set: int
       - forbidden_flags_bits_set: int
       - chip_id_allowlist_hex: list[str] (each 64 bytes hex)
       - min_tcb: { blSPL, teeSPL, snpSPL, ucodeSPL } minimum values (0-255)
@@ -503,22 +516,22 @@ def evaluate_policy(parsed: ParsedReport, policy: Dict[str, Any]) -> None:
             raise ValueError("Launch measurement mismatch")
 
     if "required_policy_bits_set" in policy:
-        mask = int(policy["required_policy_bits_set"])
+        mask = parse_mask(policy["required_policy_bits_set"])
         if (parsed.policy & mask) != mask:
             raise ValueError(f"Policy bits check failed: required mask 0x{mask:x} not fully set in report")
 
     if "forbidden_policy_bits_set" in policy:
-        mask = int(policy["forbidden_policy_bits_set"])
+        mask = parse_mask(policy["forbidden_policy_bits_set"])
         if (parsed.policy & mask) != 0:
             raise ValueError(f"Policy bits check failed: forbidden mask 0x{mask:x} is set in report")
 
     if "required_flags_bits_set" in policy:
-        mask = int(policy["required_flags_bits_set"])
+        mask = parse_mask(policy["required_flags_bits_set"])
         if (parsed.flags_u32 & mask) != mask:
             raise ValueError(f"Flags check failed: required mask 0x{mask:x} not fully set in report")
 
     if "forbidden_flags_bits_set" in policy:
-        mask = int(policy["forbidden_flags_bits_set"])
+        mask = parse_mask(policy["forbidden_flags_bits_set"])
         if (parsed.flags_u32 & mask) != 0:
             raise ValueError(f"Flags check failed: forbidden mask 0x{mask:x} is set in report")
 
