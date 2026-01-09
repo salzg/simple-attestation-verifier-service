@@ -982,7 +982,6 @@ async def handle_post_deployment(request: web.Request) -> web.Response:
             "ATTEST report signature INVALID request_id=%s exc_type=%s exc_repr=%r",
             request_id, type(e).__name__, e
         )
-        logger.error("ATTEST report signature exception traceback:\n%s", traceback.format_exc())
         return web.json_response(
             {
                 "error": "invalid report signature",
