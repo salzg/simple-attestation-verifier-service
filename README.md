@@ -4,7 +4,7 @@ SAVS is a lightweight verification + secret-release service for AMD SEV-SNP. A w
 
 Mapping to [RFC 9334](https://www.ietf.org/rfc/rfc9334.html), SAVS takes the role of a Verfier and Relying party. The Reference Values are provided in the form of a JSON file, but can be generated from tools like [ALman](https://github.com/salzg/attestation-level-manager).
 
-SAVS is split into a Server component, which implements the main logic, and a complementary Client which can be baked into SEV-SNP CVMs. Alternatively, Workload Owners are free to use their own Client and simply interact with the Server via REST API.
+SAVS is split into a Server component, which implements the main logic, and a complementary Client which can be baked into SEV-SNP CVMs. Alternatively, Workload Owners are free to use their own Client and simply interact with the Server via REST API. The SAVS Client comes in a CLI variant or a more interactive web variant (you can edit nonces, for example).
 
 ---
 
